@@ -1,0 +1,12 @@
+# Ignore the virtual environment folder
+venv/
+
+# Ignore the data folders (Databases and personal files stay strictly local!)
+data/
+
+# Ignore Python cache files (System junk)
+__pycache__/
+*.pyc
+
+# Ignore Streamlit specific settings/cache
+.streamlit/
