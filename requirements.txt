@@ -1,0 +1,16 @@
+# UI & Frontend
+streamlit
+streamlit-diff-viewer
+
+# Database & AI Logic
+chromadb
+sentence-transformers
+scikit-learn
+
+# File Parsing
+PyMuPDF
+python-docx
+pdf2docx
+
+# Local LLM Integration
+ollama
