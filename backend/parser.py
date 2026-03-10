@@ -21,7 +21,7 @@ def extract_text_from_file(filepath: str) -> dict:
     }
 
     try:
-        # 2. File Size Check & Validation (Max 10MB)
+        # 2. File Size Check & Validation (Max 100MB)
         try:
             file_size = os.path.getsize(filepath)
         except OSError:
@@ -30,8 +30,8 @@ def extract_text_from_file(filepath: str) -> dict:
             
         result['metadata']['file_size'] = file_size
         
-        # 10MB limit (10 * 1024 * 1024 bytes)
-        if file_size > 10485760:
+        # 100MB limit (100 * 1024 * 1024 bytes)
+        if file_size > 104857600:
             result['error'] = "File too large"
             return result
 
