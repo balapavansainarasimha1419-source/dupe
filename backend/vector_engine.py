@@ -2,7 +2,7 @@ import os
 import sys
 import logging
 import chromadb
-from sklearn.cluster import KMeans
+from sklearn.cluster import HDBSCAN
 
 # Bypass the strict Intel OpenMP DLL conflict (very common with PyTorch on Windows)
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
@@ -143,11 +143,12 @@ class VectorDB:
             return []
 
     # ==========================================
-    # PART C: Clustering Module (K-Means Logic)
+    # PART C: Clustering Module (HDBSCAN Logic)
     # ==========================================
-    def cluster_files(self, n_clusters: int = 3) -> dict:
+    def cluster_files(self, min_cluster_size: int = 2) -> dict:
         """
-        Organizes files into semantic clusters, with fixes for Truth Value ambiguity.
+        Organizes files into semantic clusters using HDBSCAN.
+        Automatically determines the number of clusters and isolates noise/outliers.
         """
         if not self.collection:
             return {'error': 'Database unavailable'}
@@ -157,20 +158,117 @@ class VectorDB:
             embeddings = data.get('embeddings')
             metadatas = data.get('metadatas')
             
-            if embeddings is None or len(embeddings) < n_clusters:
+            # Check if we have enough files to form even a single minimum-sized cluster
+            if embeddings is None or len(embeddings) < min_cluster_size:
                 total_files = len(embeddings) if embeddings is not None else 0
-                return {'warning': f'Not enough files ({total_files}) to form {n_clusters} clusters. Please scan at least {n_clusters} files!'}
+                return {
+                    'warning': f'Not enough files ({total_files}) to form a cluster. '
+                               f'Please scan at least {min_cluster_size} files!'
+                }
                 
-            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
-            labels = kmeans.fit_predict(embeddings)
+            # Initialize HDBSCAN
+            # metric='euclidean' works well with SentenceTransformers default embeddings
+            hdb = HDBSCAN(
+                min_cluster_size=min_cluster_size, 
+                metric='euclidean',
+                n_jobs=-1 # Uses all available CPU cores for speed
+            )
             
-            clusters = {i: [] for i in range(n_clusters)}
+            labels = hdb.fit_predict(embeddings)
+            
+            clusters = {}
             for label, meta in zip(labels, metadatas):
                 filename = meta.get('filename', 'Unknown')
-                clusters[label].append(filename)
+                
+                # HDBSCAN assigns the label -1 to data points it considers "noise"
+                if label == -1:
+                    cluster_name = "Uncategorized / Noise"
+                else:
+                    cluster_name = f"Cluster {label}"
+                    
+                if cluster_name not in clusters:
+                    clusters[cluster_name] = []
+                    
+                clusters[cluster_name].append(filename)
                 
             return clusters
             
         except Exception as e:
-            logging.error(f"Error during K-Means clustering: {e}")
+            logging.error(f"Error during HDBSCAN clustering: {e}")
             return {'error': f"Clustering failed: {str(e)}"}
+    
+
+    def search_documents(self, query_text: str, top_k: int = 5, distance_threshold: float = 1.5):
+        """
+        Hybrid Search: Combines AI Semantic Search with Case-Insensitive Keyword Matching.
+        """
+        if not query_text.strip():
+            return {"error": "Empty search query."}
+
+        try:
+            matches = {}
+            # Convert the user's query to lowercase right away
+            query_lower = query_text.lower()
+
+            # ==========================================
+            # 1. LEXICAL SEARCH (Case-Insensitive Match)
+            # ==========================================
+            # Fetch records and use Python's .lower() to bypass ChromaDB's case-sensitivity
+            all_records = self.collection.get(include=['metadatas', 'documents'])
+            
+            if all_records and all_records.get('documents'):
+                docs = all_records['documents']
+                metas = all_records['metadatas']
+                
+                for doc, meta in zip(docs, metas):
+                    # Check if the lowercase query exists in the lowercase document
+                    if query_lower in doc.lower():
+                        filepath = meta.get('filepath', 'Unknown')
+                        matches[filepath] = {
+                            "filename": meta.get('filename', 'Unknown'),
+                            "filepath": filepath,
+                            "snippet": doc[:200] + "..." if len(doc) > 200 else doc,
+                            "distance": "Exact Match", 
+                            "score": 0.0 
+                        }
+
+            # ==========================================
+            # 2. SEMANTIC SEARCH (AI Vector Match)
+            # ==========================================
+            # Embeddings naturally handle case-insensitivity well
+            query_embedding = self.model.encode(query_text).tolist()
+            vector_results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=top_k,
+                include=['metadatas', 'documents', 'distances']
+            )
+
+            v_docs = vector_results.get('documents', [[]])[0]
+            v_metas = vector_results.get('metadatas', [[]])[0]
+            v_dists = vector_results.get('distances', [[]])[0]
+
+            for doc, meta, dist in zip(v_docs, v_metas, v_dists):
+                filepath = meta.get('filepath', 'Unknown')
+                
+                if dist <= distance_threshold and filepath not in matches:
+                    matches[filepath] = {
+                        "filename": meta.get('filename', 'Unknown'),
+                        "filepath": filepath,
+                        "snippet": doc[:200] + "..." if len(doc) > 200 else doc,
+                        "distance": round(dist, 4),
+                        "score": dist
+                    }
+
+            # ==========================================
+            # 3. MERGE & SORT RESULTS
+            # ==========================================
+            if not matches:
+                return {"error": "No matches found (neither exact keyword nor semantic)."}
+
+            final_results = list(matches.values())
+            final_results.sort(key=lambda x: x['score'])
+
+            return {"matches": final_results[:top_k]}
+
+        except Exception as e:
+            return {"error": str(e)}
