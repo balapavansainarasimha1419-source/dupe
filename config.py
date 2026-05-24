@@ -50,7 +50,7 @@ SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".txt"]
 # backend/editor.py will read these. Do not hardcode them in editor.py.
 
 # The local Ollama model to use for the AI Editor feature.
-OLLAMA_MODEL = "llama3"
+OLLAMA_MODEL = "gemma3:4b"
 
 # Hard cap on words sent to the local model per request.
 # Prevents CPU crashes on standard hardware by limiting context window size.
@@ -94,3 +94,93 @@ ENABLE_FILLER_CLEANING = True
 FILLER_FREQUENCY_THRESHOLD = 0.03
 FILLER_MIN_WORD_LENGTH = 3
 MIN_WORDS_FOR_CLEANING = 50
+
+
+# ================================================================
+# AI EDITOR SETTINGS
+# ================================================================
+
+# Maximum estimated tokens before rejecting a file as too large
+# for safe deterministic full-file editing.
+#
+# Hardware: HP Victus, RTX 2050 (4GB VRAM)
+#   - Gemma 3 4B weights  : ~2.5GB VRAM
+#   - Remaining for KV    : ~1.5GB → safe num_ctx = 8192
+#   - Prompt overhead     : ~500 tokens
+#
+# IMPORTANT:
+# VRAM capacity is NOT the same as reliable output discipline.
+#
+# Gemma 3 4B can technically fit more than 3500 tokens,
+# but deterministic full-file regeneration becomes unstable
+# beyond this range. At larger sizes it may:
+#   - truncate output
+#   - drop closing XML tags
+#   - silently omit sections of the file
+#
+# Large files should use section-level editing instead
+# of full-file regeneration.
+MAX_FILE_TOKENS = 3500
+
+# Context window passed to Ollama during edit generation.
+#
+# Tuned specifically for RTX 2050 4GB VRAM headroom.
+# Increasing this without stronger hardware may cause:
+#   - VRAM exhaustion
+#   - generation instability
+#   - slower inference
+OLLAMA_NUM_CTX = 8192
+
+# Maximum undo snapshots stored per editing session.
+# Oldest snapshot is dropped silently once the cap is reached.
+UNDO_STACK_LIMIT = 10
+
+# Ollama sampling settings for deterministic editing.
+#
+# Low temperature forces stronger instruction-following
+# instead of improvisation — critical for:
+#   - XML output discipline
+#   - stable formatting
+#   - reproducible edits
+OLLAMA_TEMPERATURE = 0.1
+OLLAMA_TOP_P = 0.9
+
+# Maximum allowed output size relative to original file size.
+#
+# Example:
+#   original   = 1000 chars
+#   max output = 3000 chars
+#
+# Prevents runaway hallucinated file expansion.
+MAX_EDIT_SIZE_MULTIPLIER = 3.0
+
+# Timeout in seconds for AI edit generation.
+#
+# Separate from INFERENCE_TIMEOUT intentionally.
+# Editing and chat are different workloads and should
+# be independently tunable.
+OLLAMA_EDIT_TIMEOUT = 120
+
+OLLAMA_CHAT_TEMPERATURE = 0.2
+OLLAMA_EXPLAIN_TEMPERATURE = 0.3
+
+# ================================================================
+# PROTECTED DIRECTORIES
+# ================================================================
+
+# Directories the AI editor must NEVER modify.
+#
+# Checked at:
+#   1. context-build time (early rejection before Ollama is called)
+#   2. file-write time   (final safety guard before disk write)
+#
+# Both checks are intentional — do not remove either layer.
+PROTECTED_PATHS = [
+    ".git",
+    "__pycache__",
+    "venv",
+    "node_modules",
+    "data/chroma_db",
+    "models",
+    ".cache",
+]
