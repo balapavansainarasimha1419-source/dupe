@@ -13,3 +13,6 @@ __pycache__/
 
 # Ignore models
 models/
+
+# Ignore temp conversion folder
+temp/
