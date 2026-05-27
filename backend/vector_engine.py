@@ -28,29 +28,12 @@ class VectorDB:
     
     def __init__(self):
         try:
-            # OFFLINE GUARANTEE: Two arguments work together to enforce this:
-            #
-            #   cache_folder=config.MODEL_CACHE_DIR
-            #       Tells sentence-transformers to look ONLY in the project's own models/
-            #       folder. It will never touch ~/.cache/huggingface/ or any system path.
-            #
-            #   local_files_only=True
-            #       Tells the HuggingFace backend to make zero network calls.
-            #       If the model is not found in cache_folder, it raises OSError
-            #       immediately rather than silently downloading from the internet.
-            #
-            # If this raises OSError, it means setup_models.py has not been run yet.
-            # That is the correct failure mode — loud and clear, not a silent phone-home.
             self.model = SentenceTransformer(
                 config.MODEL_NAME,
                 cache_folder=str(config.MODEL_CACHE_DIR),
                 local_files_only=True
             )
         except OSError:
-            # Model not found locally — setup_models.py has not been run.
-            # Log a clear, actionable message and continue with model=None.
-            # The app will still start; AI features will show their "not ready" messages
-            # rather than crashing the entire application.
             logging.error(
                 "OFFLINE SETUP REQUIRED: Embedding model not found in local cache.\n"
                 f"  Expected location : {config.MODEL_CACHE_DIR}\n"
@@ -67,7 +50,7 @@ class VectorDB:
             self.chroma_client = chromadb.PersistentClient(path=str(config.CHROMA_DB_DIR))
             self.collection = self.chroma_client.get_or_create_collection(
                 name="filesense_docs",
-                metadata={"hnsw:space": "cosine"}  # <--- explicitly forces Cosine Similarity math
+                metadata={"hnsw:space": "cosine"}
             )
         except Exception as e:
             logging.error(f"Critical error initializing ChromaDB: {e}")
@@ -82,9 +65,7 @@ class VectorDB:
         if not self.chroma_client:
             return False
         try:
-            # Annihilate the entire collection
             self.chroma_client.delete_collection("filesense_docs")
-            # Create a fresh, empty one in its place
             self.collection = self.chroma_client.get_or_create_collection(name="filesense_docs")
             return True
         except Exception as e:
@@ -110,18 +91,11 @@ class VectorDB:
     # ==========================================
     # PART B: Memory Management & Search (ChromaDB)
     # ==========================================
-
-    # FIX 2: DELETED the first get_file_metadata() that lived here (old lines 61-73).
-    # It used ChromaDB 'ids' as dict keys which was WRONG for delta sync.
-    # The correct version below uses 'filepath' from metadata as the key.
-
     def remove_file(self, filepath: str) -> bool:
         """Removes a specific deleted file from the AI's memory."""
         if not self.collection:
             return False
         try:
-            # FIX 3: ID in ChromaDB is now the filepath itself (see add_file fix below),
-            # so we delete by filepath directly. This replaces the old uuid-based delete.
             self.collection.delete(ids=[filepath])
             return True
         except Exception as e:
@@ -137,23 +111,20 @@ class VectorDB:
             return False
             
         try:
-            # Use filepath as the stable document ID instead of uuid4().
             doc_id = filepath
 
-            # Clean extracted text before embedding
+            # Clean extracted text before embedding to maintain semantic accuracy
             ext = os.path.splitext(filepath)[1].lower()
             cleaned_text = remove_fillers(text, file_extension=ext)
 
-            # Convert the text into an AI embedding
             embedding = self._generate_embedding(cleaned_text)
             
             if embedding:
-                # Upsert safely replaces the record if the ID already exists.
                 self.collection.upsert(
                     documents=[cleaned_text],
                     embeddings=[embedding],
                     metadatas=[{
-                        "filename": filename,
+                        "filename": filename, 
                         "filepath": filepath,
                         "mtime": mtime,
                         "preserve_structure": preserve_structure,
@@ -180,17 +151,14 @@ class VectorDB:
             return {}
             
         try:
-            # We only need the metadata, no need to load heavy documents into RAM
             results = self.collection.get(include=['metadatas'])
             metas = results.get('metadatas', [])
             
             file_dict = {}
             for meta in metas:
                 if meta:
-                    # Safely grab the filepath
                     path = meta.get('filepath') or meta.get('path')
                     if path:
-                        # Grab the timestamp. If it's an older file without one, default to 0.0
                         file_dict[path] = meta.get('mtime', 0.0)
                         
             return file_dict
@@ -202,65 +170,47 @@ class VectorDB:
     # PART C: Clustering Module (HDBSCAN Logic)
     # ==========================================
     def cluster_files(self, min_cluster_size: int = 2) -> dict:
-        """
-        Organizes files into semantic clusters using HDBSCAN.
-        Automatically determines the number of clusters and isolates noise/outliers.
-        """
-        if not self.collection:
-            return {'error': 'Database unavailable'}
+     if not self.collection:
+        return {'error': 'Database unavailable'}
+        
+     try:
+        data = self.collection.get(include=['embeddings', 'metadatas'])
+        embeddings = data.get('embeddings')
+        metadatas  = data.get('metadatas')
+        
+        if embeddings is None or len(embeddings) < min_cluster_size:
+            total_files = len(embeddings) if embeddings is not None else 0
+            return {
+                'warning': f'Not enough files ({total_files}) to form a cluster. '
+                           f'Please scan at least {min_cluster_size} files!'
+            }
             
-        try:
-            data = self.collection.get(include=['embeddings', 'metadatas'])
-            embeddings = data.get('embeddings')
-            metadatas = data.get('metadatas')
+        hdb = HDBSCAN(min_cluster_size=min_cluster_size, metric='euclidean', n_jobs=-1)
+        labels = hdb.fit_predict(embeddings)
+        
+        clusters = {}
+        for label, meta in zip(labels, metadatas):
+            cluster_name = "Uncategorized / Noise" if label == -1 else f"Cluster {label}"
             
-            # Check if we have enough files to form even a single minimum-sized cluster
-            if embeddings is None or len(embeddings) < min_cluster_size:
-                total_files = len(embeddings) if embeddings is not None else 0
-                return {
-                    'warning': f'Not enough files ({total_files}) to form a cluster. '
-                               f'Please scan at least {min_cluster_size} files!'
-                }
-                
-            # Initialize HDBSCAN
-            # metric='euclidean' works well with SentenceTransformers default embeddings
-            hdb = HDBSCAN(
-                min_cluster_size=min_cluster_size, 
-                metric='euclidean',
-                n_jobs=-1  # Uses all available CPU cores for speed
-            )
+            if cluster_name not in clusters:
+                clusters[cluster_name] = []
             
-            labels = hdb.fit_predict(embeddings)
+            clusters[cluster_name].append({
+                "filename": meta.get("filename", "Unknown"),
+                "filepath": meta.get("filepath", "")
+            })
             
-            clusters = {}
-            for label, meta in zip(labels, metadatas):
-                filename = meta.get('filename', 'Unknown')
-                
-                # HDBSCAN assigns the label -1 to data points it considers "noise"
-                if label == -1:
-                    cluster_name = "Uncategorized / Noise"
-                else:
-                    cluster_name = f"Cluster {label}"
-                    
-                if cluster_name not in clusters:
-                    clusters[cluster_name] = []
-                    
-                clusters[cluster_name].append(filename)
-                
-            return clusters
-            
-        except Exception as e:
-            logging.error(f"Error during HDBSCAN clustering: {e}")
-            return {'error': f"Clustering failed: {str(e)}"}
+        return clusters
+        
+     except Exception as e:
+        logging.error(f"Error during HDBSCAN clustering: {e}")
+        return {'error': f"Clustering failed: {str(e)}"}
 
-
-    def search_documents(self, query_text: str, top_k: int = 5, distance_threshold: float = 1.5):
+    def search_documents(self, query_text: str, top_k: int = 50, distance_threshold: float = 1.5):
         """
         Hybrid Search: Combines AI Semantic Search with Case-Insensitive Keyword Matching
         and a Fuzzy fallback for misspellings.
         """
-        # FIX 6: Guard against model or collection being None.
-        # Previously self.model.encode() would crash with AttributeError if model failed to load.
         if not self.model or not self.collection:
             return {"error": "AI engine not ready. Check startup logs for errors."}
 
@@ -273,7 +223,7 @@ class VectorDB:
             query_words = query_lower.split()
 
             # ==========================================
-            # 1. LEXICAL SEARCH (Case-Insensitive Substring Match)
+            # 1. LEXICAL SEARCH
             # ==========================================
             all_records = self.collection.get(include=['metadatas', 'documents'])
             
@@ -288,22 +238,15 @@ class VectorDB:
 
                     is_match = False
 
-                    # Direct substring match in content or filename
                     if query_lower in doc_lower or query_lower in filename_lower:
                         is_match = True
 
-                    # FIX 7: Fuzzy fallback for misspellings — raised cutoff from 0.50 to 0.75
-                    # to prevent false positives. Only fires if direct match fails.
-                    # This replaces the dead search() method's fuzzy logic and makes it
-                    # actually reachable from the UI.
                     if not is_match:
                         filename_words = set(re.findall(r'\b\w+\b', filename_lower))
                         doc_vocabulary = set(re.findall(r'\b\w+\b', doc_lower))
                         total_vocabulary = filename_words.union(doc_vocabulary)
 
                         for q_word in query_words:
-                            # 0.75 cutoff: "resume" matches "resumé", "python" matches "pyhton"
-                            # but NOT "cat" matching "car" or other false positives
                             if difflib.get_close_matches(q_word, total_vocabulary, n=1, cutoff=0.75):
                                 is_match = True
                                 break
@@ -318,7 +261,7 @@ class VectorDB:
                         }
 
             # ==========================================
-            # 2. SEMANTIC SEARCH (AI Vector Match)
+            # 2. SEMANTIC SEARCH
             # ==========================================
             query_embedding = self.model.encode(query_text).tolist()
             vector_results = self.collection.query(
